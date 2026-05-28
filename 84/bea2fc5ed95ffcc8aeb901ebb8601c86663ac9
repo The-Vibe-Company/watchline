@@ -1,0 +1,27 @@
+docs/PRD.md
+  s_97769d54d48082::t_039256496bacd7 15-87
+package.json
+  s_97769d54d48082::t_039256496bacd7 2
+.github/workflows/release.yml
+  s_97769d54d48082::t_61694a073978c5 41-63
+CHANGELOG.md
+  s_97769d54d48082::t_039256496bacd7 1
+README.md
+  s_97769d54d48082::t_039256496bacd7 19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "84bea2fc5ed95ffcc8aeb901ebb8601c86663ac9",
+  "prompts": {},
+  "sessions": {
+    "s_97769d54d48082": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e6f97-0647-76d3-ad2d-9b2ad57433cd",
+        "model": "gpt-5.5"
+      },
+      "human_author": null
+    }
+  }
+}
