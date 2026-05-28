@@ -1,0 +1,14 @@
+name = "watchline"
+main = "dist/worker.js"
+compatibility_date = "2026-05-28"
+
+[triggers]
+crons = ["* * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "watchline"
+database_id = "replace-with-your-d1-database-id"
+
+[vars]
+WATCHLINE_MAX_CHECKS_PER_CRON = "25"
