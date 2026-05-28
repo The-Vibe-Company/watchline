@@ -1,0 +1,25 @@
+CHANGELOG.md
+  s_97769d54d48082::t_039256496bacd7 1
+README.md
+  s_97769d54d48082::t_039256496bacd7 19
+package.json
+  s_97769d54d48082::t_039256496bacd7 2
+docs/PRD.md
+  s_97769d54d48082::t_039256496bacd7 15-87
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "e0864ee71f256978f34b5f19132be11e711fcf92",
+  "prompts": {},
+  "sessions": {
+    "s_97769d54d48082": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e6f97-0647-76d3-ad2d-9b2ad57433cd",
+        "model": "gpt-5.5"
+      },
+      "human_author": "StanGirard <stan@quivr.app>"
+    }
+  }
+}
