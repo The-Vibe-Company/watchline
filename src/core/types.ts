@@ -124,6 +124,9 @@ export interface MonitorConfig {
   body?: string;
   expectedStatus?: number;
   extractor?: MonitorExtractor;
+  webhookUrl?: string;
+  notificationEmail?: string;
+  notifyEvents?: string[];
 }
 
 export interface PreviousCheck {

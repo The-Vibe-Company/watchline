@@ -3,7 +3,9 @@ import type { Extractor, MonitorConfig, MonitorMode, PreviousCheck } from "./ind
 
 export interface Env {
   DB: D1Database;
+  RESEND_API_KEY?: string;
   WATCHLINE_ADMIN_TOKEN?: string;
+  WATCHLINE_EMAIL_FROM?: string;
   WATCHLINE_MAX_CHECKS_PER_CRON?: string;
 }
 
@@ -19,6 +21,9 @@ interface MonitorRow {
   body: string | null;
   expected_status: number | null;
   extractor_json: string | null;
+  webhook_url: string | null;
+  notification_email: string | null;
+  notify_events: string;
   last_hash: string | null;
   last_status: "up" | "down" | null;
   last_checked_at: string | null;
@@ -73,8 +78,9 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     await env.DB.prepare(
       `INSERT INTO monitors (
         id, name, url, mode, interval_minutes, enabled, method, headers_json,
-        body, expected_status, extractor_json, next_check_at
-      ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)`
+        body, expected_status, extractor_json, webhook_url, notification_email,
+        notify_events, next_check_at
+      ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
       .bind(
         id,
@@ -87,6 +93,9 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         monitor.body ?? null,
         monitor.expectedStatus ?? null,
         monitor.extractor ? JSON.stringify(monitor.extractor) : null,
+        monitor.webhookUrl ?? null,
+        monitor.notificationEmail ?? null,
+        (monitor.notifyEvents ?? ["changed", "down", "recovered"]).join(","),
         nextCheckAt
       )
       .run();
@@ -170,6 +179,7 @@ async function runMonitor(env: Env, row: MonitorRow): Promise<unknown> {
   const nextCheckAt = new Date(
     checkedAt.getTime() + row.interval_minutes * 60_000
   ).toISOString();
+  const runId = crypto.randomUUID();
 
   await env.DB.prepare(
     `INSERT INTO runs (
@@ -178,7 +188,7 @@ async function runMonitor(env: Env, row: MonitorRow): Promise<unknown> {
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   )
     .bind(
-      crypto.randomUUID(),
+      runId,
       row.id,
       checkedAt.toISOString(),
       result.ok ? 1 : 0,
@@ -207,6 +217,19 @@ async function runMonitor(env: Env, row: MonitorRow): Promise<unknown> {
     )
     .run();
 
+  const event = notificationEvent(row, result);
+  const notification = event
+    ? await sendNotification(env, row, result, event, checkedAt.toISOString())
+    : { sent: false };
+
+  if (event) {
+    await env.DB.prepare(
+      "UPDATE runs SET notification_sent = ?, notification_error = ? WHERE id = ?"
+    )
+      .bind(notification.sent ? 1 : 0, notification.error ?? null, runId)
+      .run();
+  }
+
   return { monitorId: row.id, nextCheckAt, result };
 }
 
@@ -230,7 +253,10 @@ function normalizeMonitorInput(input: Partial<MonitorConfig>): MonitorConfig {
     method: input.method ?? "GET",
     mode,
     name: input.name,
-    url: input.url
+    notificationEmail: input.notificationEmail,
+    notifyEvents: input.notifyEvents,
+    url: input.url,
+    webhookUrl: input.webhookUrl
   };
 }
 
@@ -248,7 +274,10 @@ function rowToMonitorConfig(row: MonitorRow): MonitorConfig {
     method: row.method,
     mode: row.mode,
     name: row.name,
-    url: row.url
+    notificationEmail: row.notification_email ?? undefined,
+    notifyEvents: row.notify_events.split(",").filter(Boolean),
+    url: row.url,
+    webhookUrl: row.webhook_url ?? undefined
   };
 }
 
@@ -263,8 +292,227 @@ function rowToMonitorView(row: MonitorRow): Record<string, unknown> {
     mode: row.mode,
     name: row.name,
     nextCheckAt: row.next_check_at,
-    url: row.url
+    notifyEvents: row.notify_events.split(",").filter(Boolean),
+    emailConfigured: Boolean(row.notification_email),
+    url: row.url,
+    webhookConfigured: Boolean(row.webhook_url)
   };
+}
+
+function notificationEvent(
+  row: MonitorRow,
+  result: Awaited<ReturnType<typeof runCheck>>
+): "changed" | "down" | "recovered" | undefined {
+  const events = new Set(row.notify_events.split(",").filter(Boolean));
+
+  if (result.changed && events.has("changed")) {
+    return "changed";
+  }
+
+  if (result.status === "down" && row.last_status !== "down" && events.has("down")) {
+    return "down";
+  }
+
+  if (result.status === "up" && row.last_status === "down" && events.has("recovered")) {
+    return "recovered";
+  }
+
+  return undefined;
+}
+
+async function sendNotification(
+  env: Env,
+  row: MonitorRow,
+  result: Awaited<ReturnType<typeof runCheck>>,
+  event: "changed" | "down" | "recovered",
+  checkedAt: string
+): Promise<{ sent: boolean; error?: string }> {
+  if (!row.webhook_url && !row.notification_email) {
+    return { sent: false };
+  }
+
+  const text = notificationText(row, result, event);
+  const errors: string[] = [];
+  let sent = false;
+
+  if (row.webhook_url) {
+    const webhook = await sendWebhook(row.webhook_url, row, result, event, checkedAt, text);
+    sent ||= webhook.sent;
+    if (webhook.error) {
+      errors.push(webhook.error);
+    }
+  }
+
+  if (row.notification_email) {
+    const email = await sendEmail(env, row.notification_email, text, row, result, event);
+    sent ||= email.sent;
+    if (email.error) {
+      errors.push(email.error);
+    }
+  }
+
+  return {
+    sent,
+    error: errors.length ? errors.join("; ") : undefined
+  };
+}
+
+async function sendWebhook(
+  webhookUrl: string,
+  row: MonitorRow,
+  result: Awaited<ReturnType<typeof runCheck>>,
+  event: "changed" | "down" | "recovered",
+  checkedAt: string,
+  text: string
+): Promise<{ sent: boolean; error?: string }> {
+  const payload = {
+    text,
+    content: text,
+    event,
+    checkedAt,
+    monitor: {
+      id: row.id,
+      name: row.name,
+      url: row.url,
+      mode: row.mode
+    },
+    result: {
+      changed: result.changed,
+      diffSummary: result.diffSummary,
+      error: result.error,
+      hash: result.hash,
+      responseTimeMs: result.responseTimeMs,
+      status: result.status,
+      statusCode: result.statusCode
+    }
+  };
+
+  try {
+    const response = await fetch(webhookUrl, {
+      body: JSON.stringify(payload),
+      headers: {
+        "content-type": "application/json",
+        "user-agent": "watchline/0.2"
+      },
+      method: "POST"
+    });
+
+    if (!response.ok) {
+      return {
+        sent: false,
+        error: `webhook returned ${response.status}`
+      };
+    }
+
+    return { sent: true };
+  } catch (error) {
+    return {
+      sent: false,
+      error: `webhook failed: ${error instanceof Error ? error.message : String(error)}`
+    };
+  }
+}
+
+async function sendEmail(
+  env: Env,
+  to: string,
+  text: string,
+  row: MonitorRow,
+  result: Awaited<ReturnType<typeof runCheck>>,
+  event: "changed" | "down" | "recovered"
+): Promise<{ sent: boolean; error?: string }> {
+  if (!env.RESEND_API_KEY) {
+    return { sent: false, error: "RESEND_API_KEY is missing" };
+  }
+
+  if (!env.WATCHLINE_EMAIL_FROM) {
+    return { sent: false, error: "WATCHLINE_EMAIL_FROM is missing" };
+  }
+
+  const subject = `Watchline: ${row.name} ${event}`;
+
+  try {
+    const response = await fetch("https://api.resend.com/emails", {
+      body: JSON.stringify({
+        from: env.WATCHLINE_EMAIL_FROM,
+        to: [to],
+        subject,
+        text,
+        html: emailHtml(text, row, result, event)
+      }),
+      headers: {
+        authorization: `Bearer ${env.RESEND_API_KEY}`,
+        "content-type": "application/json"
+      },
+      method: "POST"
+    });
+
+    if (!response.ok) {
+      return {
+        sent: false,
+        error: `resend returned ${response.status}: ${await response.text()}`
+      };
+    }
+
+    return { sent: true };
+  } catch (error) {
+    return {
+      sent: false,
+      error: `resend failed: ${error instanceof Error ? error.message : String(error)}`
+    };
+  }
+}
+
+function emailHtml(
+  text: string,
+  row: MonitorRow,
+  result: Awaited<ReturnType<typeof runCheck>>,
+  event: "changed" | "down" | "recovered"
+): string {
+  return `<!doctype html>
+<html>
+<body style="font-family:Inter,Arial,sans-serif;line-height:1.5;color:#1d1d1b">
+  <h2 style="margin:0 0 12px">Watchline: ${escapeHtml(row.name)} ${event}</h2>
+  <p><a href="${escapeHtml(row.url)}">${escapeHtml(row.url)}</a></p>
+  <ul>
+    <li>Status: ${escapeHtml(result.status)}</li>
+    <li>HTTP: ${escapeHtml(String(result.statusCode ?? "-"))}</li>
+    <li>Response time: ${escapeHtml(String(result.responseTimeMs))}ms</li>
+  </ul>
+  <pre style="white-space:pre-wrap;background:#f6f6f3;padding:12px;border-radius:6px">${escapeHtml(text)}</pre>
+</body>
+</html>`;
+}
+
+function notificationText(
+  row: MonitorRow,
+  result: Awaited<ReturnType<typeof runCheck>>,
+  event: "changed" | "down" | "recovered"
+): string {
+  const label =
+    event === "changed"
+      ? "changed"
+      : event === "down"
+        ? "is down"
+        : "recovered";
+  const status = result.statusCode ? `HTTP ${result.statusCode}` : result.status;
+  const suffix = result.diffSummary ? `\n\n${result.diffSummary}` : "";
+
+  return `Watchline: ${row.name} ${label} (${status}, ${result.responseTimeMs}ms)\n${row.url}${suffix}`;
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => {
+    const entities: Record<string, string> = {
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      "\"": "&quot;",
+      "'": "&#039;"
+    };
+
+    return entities[char] ?? char;
+  });
 }
 
 function requireAuth(request: Request, env: Env): void {
@@ -313,7 +561,7 @@ function renderApp(): string {
     header { display: flex; align-items: end; justify-content: space-between; gap: 16px; margin-bottom: 24px; }
     h1 { font-size: 28px; margin: 0; letter-spacing: 0; }
     p { color: #5b5b55; margin: 6px 0 0; }
-    form { display: grid; grid-template-columns: 1.2fr 2fr 140px 120px; gap: 8px; margin-bottom: 18px; }
+    form { display: grid; grid-template-columns: 1fr 1.8fr 130px 1.5fr 1.2fr 110px; gap: 8px; margin-bottom: 18px; }
     input, select, button { border: 1px solid #cbc8bd; border-radius: 6px; font: inherit; min-height: 38px; padding: 0 10px; background: #fff; color: #1d1d1b; }
     button { background: #1d1d1b; color: #fff; cursor: pointer; font-weight: 600; }
     table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #dedbd2; }
@@ -344,11 +592,13 @@ function renderApp(): string {
         <option value="uptime">Uptime</option>
         <option value="field">Field</option>
       </select>
+      <input name="webhookUrl" placeholder="Webhook URL">
+      <input name="notificationEmail" placeholder="Email">
       <button>Add</button>
     </form>
     <table>
-      <thead><tr><th>Name</th><th>URL</th><th>Mode</th><th>Status</th><th>Next check</th><th></th></tr></thead>
-      <tbody id="monitors"><tr><td colspan="6">Loading...</td></tr></tbody>
+      <thead><tr><th>Name</th><th>URL</th><th>Mode</th><th>Status</th><th>Notify</th><th>Next check</th><th></th></tr></thead>
+      <tbody id="monitors"><tr><td colspan="7">Loading...</td></tr></tbody>
     </table>
   </main>
   <script>
@@ -367,8 +617,9 @@ function renderApp(): string {
       const monitors = await api("/api/monitors");
       tbody.innerHTML = monitors.length ? monitors.map((monitor) => {
         const status = monitor.lastStatus || "pending";
-        return '<tr><td>' + escapeHtml(monitor.name) + '</td><td>' + escapeHtml(monitor.url) + '</td><td>' + monitor.mode + '</td><td><span class="status ' + status + '"><span class="dot"></span>' + status + '</span></td><td>' + (monitor.nextCheckAt || "") + '</td><td class="actions"><button data-check="' + monitor.id + '">Check</button><button data-delete="' + monitor.id + '">Delete</button></td></tr>';
-      }).join("") : '<tr><td colspan="6">No monitors yet.</td></tr>';
+        const notify = [monitor.webhookConfigured ? 'Webhook' : '', monitor.emailConfigured ? 'Email' : ''].filter(Boolean).join(', ') || '-';
+        return '<tr><td>' + escapeHtml(monitor.name) + '</td><td>' + escapeHtml(monitor.url) + '</td><td>' + monitor.mode + '</td><td><span class="status ' + status + '"><span class="dot"></span>' + status + '</span></td><td>' + notify + '</td><td>' + (monitor.nextCheckAt || "") + '</td><td class="actions"><button data-check="' + monitor.id + '">Check</button><button data-delete="' + monitor.id + '">Delete</button></td></tr>';
+      }).join("") : '<tr><td colspan="7">No monitors yet.</td></tr>';
     }
 
     form.addEventListener("submit", async (event) => {

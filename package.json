@@ -1,6 +1,6 @@
 {
   "name": "watchline",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Tiny serverless uptime and page-change monitor for Cloudflare Workers.",
   "type": "module",
   "license": "MIT",

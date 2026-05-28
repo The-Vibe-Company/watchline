@@ -11,6 +11,7 @@ Watchline is built for small projects, solo builders, and teams that want a chea
 - Cloudflare Worker API and compact UI
 - Cloudflare D1 schema
 - Single cron-driven scheduler
+- Webhook notifications for changed/down/recovered events
 - GitHub Actions CI and npm release workflow
 
 ## Install
@@ -52,6 +53,45 @@ Set an admin token for write actions:
 npx wrangler secret put WATCHLINE_ADMIN_TOKEN
 ```
 
+For email notifications through Resend:
+
+```sh
+npx wrangler secret put RESEND_API_KEY
+npx wrangler secret put WATCHLINE_EMAIL_FROM
+```
+
+`WATCHLINE_EMAIL_FROM` should use a sender verified in Resend, for example `Watchline <alerts@yourdomain.com>`.
+
+## Notifications
+
+Watchline sends notifications through a generic webhook URL and/or Resend email configured per monitor. Webhooks work with Slack incoming webhooks, Discord webhooks, n8n, Make, Zapier, or any HTTP endpoint that accepts JSON.
+
+From the UI, paste the webhook URL in the `Webhook URL` field or an email address in the `Email` field when creating a monitor.
+
+From the API:
+
+```sh
+curl -X POST https://your-worker.example.com/api/monitors \
+  -H "content-type: application/json" \
+  -H "x-watchline-token: $WATCHLINE_ADMIN_TOKEN" \
+  -d '{
+    "name": "Docs",
+    "url": "https://example.com/docs",
+    "mode": "page",
+    "intervalMinutes": 60,
+    "webhookUrl": "https://hooks.slack.com/services/...",
+    "notificationEmail": "you@example.com"
+  }'
+```
+
+Notifications are sent when:
+
+- a page or tracked field changes;
+- a monitor goes down for the first time;
+- a monitor recovers after being down.
+
+The webhook body includes `text` for Slack, `content` for Discord, plus a structured JSON payload with the monitor, event, result, and diff summary.
+
 ## API
 
 ```sh
@@ -66,7 +106,8 @@ curl -X POST https://your-worker.example.com/api/monitors \
     "name": "Docs",
     "url": "https://example.com/docs",
     "mode": "page",
-    "intervalMinutes": 60
+    "intervalMinutes": 60,
+    "webhookUrl": "https://hooks.slack.com/services/..."
   }'
 ```
 
